@@ -1,3 +1,5 @@
+import pprint
+
 import numpy as np
 import torch
 
@@ -27,13 +29,32 @@ while not (done or trunc):
         action, _, _, _ = agent.get_action_and_value(obs_t, deterministic=True)
     obs, reward, done, trunc, info = env.step(action.squeeze(0).numpy())
 
-print(
-    "episode_return_info:",
+termination_reason = "unknown"
+if info.get("collision", False):
+    termination_reason = "collision"
+elif info.get("out_of_bounds", False):
+    termination_reason = "out_of_bounds"
+elif info.get("env_complete", False):
+    termination_reason = "env_complete"
+elif trunc:
+    termination_reason = "time_limit_or_truncation"
+elif done:
+    termination_reason = "termination_without_flag"
+
+print("episode_end_summary:")
+pprint.pprint(
     {
+        "termination_reason": termination_reason,
+        "done": done,
+        "trunc": trunc,
         "num_targets_reached": info.get("num_targets_reached"),
         "env_complete": info.get("env_complete"),
+        "collision": info.get("collision"),
+        "out_of_bounds": info.get("out_of_bounds"),
         "task_config": env_kwargs,
+        "final_info": info,
     },
+    sort_dicts=False,
 )
 
 env.close()

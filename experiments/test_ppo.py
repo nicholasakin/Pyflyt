@@ -1,3 +1,4 @@
+import os
 import time
 from dataclasses import asdict, dataclass
 
@@ -11,6 +12,14 @@ from torch.distributions import Normal
 import PyFlyt.gym_envs  # noqa: F401
 
 
+def default_device() -> str:
+    if torch.cuda.is_available():
+        if torch.cuda.device_count() > 1:
+            return "cuda:1"
+        return "cuda:0"
+    return "cpu"
+
+
 # ============================================================
 # Config
 # ============================================================
@@ -18,11 +27,12 @@ import PyFlyt.gym_envs  # noqa: F401
 class Config:
     env_id: str = "PyFlyt/QuadX-Waypoints-v4"
     seed: int = 42
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = default_device()
 
-    total_timesteps: int = 1_000_000
-    num_envs: int = 8
-    num_steps: int = 1024
+    total_timesteps: int = 5_000_000
+    num_envs: int = 16
+    num_steps: int = 512
+    vector_env_backend: str = "async"
     gamma: float = 0.99
     gae_lambda: float = 0.95
 
@@ -57,8 +67,22 @@ class Config:
     train_max_duration_seconds_max: float = 16.0
     train_yaw_target_prob: float = 0.25
     sparse_reward: bool = False
+    use_curriculum: bool = True
+    curriculum_start_fraction: float = 0.0
+    curriculum_end_fraction: float = 0.6
+    curriculum_num_targets_min: int = 1
+    curriculum_num_targets_max: int = 2
+    curriculum_flight_dome_min: float = 3.0
+    curriculum_flight_dome_max: float = 4.5
+    curriculum_goal_reach_distance_min: float = 0.24
+    curriculum_goal_reach_distance_max: float = 0.35
+    curriculum_max_duration_seconds_min: float = 12.0
+    curriculum_max_duration_seconds_max: float = 18.0
+    curriculum_yaw_target_prob: float = 0.0
 
     checkpoint_path: str = "pyflyt_ppo.pt"
+    resume_from_checkpoint: bool = True
+    save_every_updates: int = 25
 
 
 cfg = Config()
@@ -76,40 +100,144 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def get_available_checkpoint_path(path: str) -> str:
+    if not os.path.exists(path):
+        return path
+
+    stem, ext = os.path.splitext(path)
+    suffix = 1
+    while True:
+        candidate = f"{stem}_{suffix}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        suffix += 1
+
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 
-def sample_train_task(random_state: np.random.Generator, cfg: Config) -> dict:
+class CurriculumScheduler:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.progress = 0.0
+
+    def set_update(self, update: int, total_updates: int):
+        if not self.cfg.use_curriculum:
+            self.progress = 1.0
+            return
+        total_updates = max(total_updates, 1)
+        frac = (update - 1) / total_updates
+        start = self.cfg.curriculum_start_fraction
+        end = self.cfg.curriculum_end_fraction
+        if frac <= start:
+            self.progress = 0.0
+        elif frac >= end:
+            self.progress = 1.0
+        else:
+            self.progress = (frac - start) / max(end - start, 1e-8)
+
+    def current_stage(self) -> dict:
+        return curriculum_stage_from_progress(self.cfg, self.progress)
+
+
+def curriculum_stage_from_progress(cfg: Config, progress: float) -> dict:
+    p = progress
+    return {
+        "num_targets_min": int(
+            round(
+                (1.0 - p) * cfg.curriculum_num_targets_min
+                + p * cfg.train_num_targets_min
+            )
+        ),
+        "num_targets_max": int(
+            round(
+                (1.0 - p) * cfg.curriculum_num_targets_max
+                + p * cfg.train_num_targets_max
+            )
+        ),
+        "flight_dome_min": float(
+            (1.0 - p) * cfg.curriculum_flight_dome_min
+            + p * cfg.train_flight_dome_min
+        ),
+        "flight_dome_max": float(
+            (1.0 - p) * cfg.curriculum_flight_dome_max
+            + p * cfg.train_flight_dome_max
+        ),
+        "goal_reach_distance_min": float(
+            (1.0 - p) * cfg.curriculum_goal_reach_distance_min
+            + p * cfg.train_goal_reach_distance_min
+        ),
+        "goal_reach_distance_max": float(
+            (1.0 - p) * cfg.curriculum_goal_reach_distance_max
+            + p * cfg.train_goal_reach_distance_max
+        ),
+        "max_duration_seconds_min": float(
+            (1.0 - p) * cfg.curriculum_max_duration_seconds_min
+            + p * cfg.train_max_duration_seconds_min
+        ),
+        "max_duration_seconds_max": float(
+            (1.0 - p) * cfg.curriculum_max_duration_seconds_max
+            + p * cfg.train_max_duration_seconds_max
+        ),
+        "yaw_target_prob": float(
+            (1.0 - p) * cfg.curriculum_yaw_target_prob
+            + p * cfg.train_yaw_target_prob
+        ),
+    }
+
+
+def sample_train_task(
+    random_state: np.random.Generator,
+    cfg: Config,
+    curriculum_progress: float | None = None,
+) -> dict:
+    stage = (
+        curriculum_stage_from_progress(cfg, curriculum_progress)
+        if curriculum_progress is not None
+        else {
+            "num_targets_min": cfg.train_num_targets_min,
+            "num_targets_max": cfg.train_num_targets_max,
+            "flight_dome_min": cfg.train_flight_dome_min,
+            "flight_dome_max": cfg.train_flight_dome_max,
+            "goal_reach_distance_min": cfg.train_goal_reach_distance_min,
+            "goal_reach_distance_max": cfg.train_goal_reach_distance_max,
+            "max_duration_seconds_min": cfg.train_max_duration_seconds_min,
+            "max_duration_seconds_max": cfg.train_max_duration_seconds_max,
+            "yaw_target_prob": cfg.train_yaw_target_prob,
+        }
+    )
+    num_targets_min = min(stage["num_targets_min"], stage["num_targets_max"])
+    num_targets_max = max(stage["num_targets_min"], stage["num_targets_max"])
     return {
         "sparse_reward": cfg.sparse_reward,
         "num_targets": int(
             random_state.integers(
-                cfg.train_num_targets_min,
-                cfg.train_num_targets_max + 1,
+                num_targets_min,
+                num_targets_max + 1,
             )
         ),
         "use_yaw_targets": bool(
-            random_state.random() < cfg.train_yaw_target_prob
+            random_state.random() < stage["yaw_target_prob"]
         ),
         "goal_reach_distance": float(
             random_state.uniform(
-                cfg.train_goal_reach_distance_min,
-                cfg.train_goal_reach_distance_max,
+                stage["goal_reach_distance_min"],
+                stage["goal_reach_distance_max"],
             )
         ),
         "flight_dome_size": float(
             random_state.uniform(
-                cfg.train_flight_dome_min,
-                cfg.train_flight_dome_max,
+                stage["flight_dome_min"],
+                stage["flight_dome_max"],
             )
         ),
         "max_duration_seconds": float(
             random_state.uniform(
-                cfg.train_max_duration_seconds_min,
-                cfg.train_max_duration_seconds_max,
+                stage["max_duration_seconds_min"],
+                stage["max_duration_seconds_max"],
             )
         ),
     }
@@ -256,17 +384,28 @@ class DomainRandomizedQuadXWaypointsEnv(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, env_id: str, cfg: Config, seed: int):
+    def __init__(
+        self,
+        env_id: str,
+        cfg: Config,
+        seed: int,
+        curriculum_progress: float = 0.0,
+    ):
         super().__init__()
         self.env_id = env_id
         self.cfg = cfg
+        self.curriculum_progress = curriculum_progress
         self.random_state = np.random.default_rng(seed)
         self.env: gym.Env | None = None
         self.current_env_kwargs: dict | None = None
 
         initial_env = build_env(
             env_id=self.env_id,
-            env_kwargs=sample_train_task(self.random_state, self.cfg),
+            env_kwargs=sample_train_task(
+                self.random_state,
+                self.cfg,
+                self.curriculum_progress,
+            ),
             cfg=self.cfg,
         )
         self.action_space = initial_env.action_space
@@ -276,12 +415,19 @@ class DomainRandomizedQuadXWaypointsEnv(gym.Env):
     def _new_env(self):
         if self.env is not None:
             self.env.close()
-        self.current_env_kwargs = sample_train_task(self.random_state, self.cfg)
+        self.current_env_kwargs = sample_train_task(
+            self.random_state,
+            self.cfg,
+            self.curriculum_progress,
+        )
         self.env = build_env(
             env_id=self.env_id,
             env_kwargs=self.current_env_kwargs,
             cfg=self.cfg,
         )
+
+    def set_curriculum_progress(self, progress: float):
+        self.curriculum_progress = float(progress)
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         self._new_env()
@@ -307,12 +453,19 @@ class DomainRandomizedQuadXWaypointsEnv(gym.Env):
         return self.env.render()
 
 
-def make_train_env(env_id: str, seed: int, idx: int, cfg: Config):
+def make_train_env(
+    env_id: str,
+    seed: int,
+    idx: int,
+    cfg: Config,
+    curriculum_progress: float = 0.0,
+):
     def thunk():
         env = DomainRandomizedQuadXWaypointsEnv(
             env_id=env_id,
             cfg=cfg,
             seed=seed + idx,
+            curriculum_progress=curriculum_progress,
         )
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.reset(seed=seed + idx)
@@ -321,6 +474,22 @@ def make_train_env(env_id: str, seed: int, idx: int, cfg: Config):
         return env
 
     return thunk
+
+
+def build_vector_env(cfg: Config, curriculum_progress: float):
+    env_fns = [
+        make_train_env(
+            cfg.env_id,
+            cfg.seed,
+            i,
+            cfg,
+            curriculum_progress=curriculum_progress,
+        )
+        for i in range(cfg.num_envs)
+    ]
+    if cfg.vector_env_backend == "async":
+        return gym.vector.AsyncVectorEnv(env_fns)
+    return gym.vector.SyncVectorEnv(env_fns)
 
 
 def make_eval_env(
@@ -472,10 +641,10 @@ def evaluate_generalization(
 def main():
     set_seed(cfg.seed)
     device = torch.device(cfg.device)
+    curriculum = CurriculumScheduler(cfg)
+    curriculum.set_update(1, num_updates)
 
-    envs = gym.vector.SyncVectorEnv(
-        [make_train_env(cfg.env_id, cfg.seed, i, cfg) for i in range(cfg.num_envs)]
-    )
+    envs = build_vector_env(cfg, curriculum.progress)
 
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
@@ -489,6 +658,36 @@ def main():
 
     agent = ActorCritic(obs_dim, act_dim, cfg.hidden_size).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=1e-5)
+    global_step = 0
+    start_update = 1
+    episodic_returns = []
+    completed_episodes = 0
+    checkpoint_path = cfg.checkpoint_path
+    running_episode_returns = np.zeros(cfg.num_envs, dtype=np.float32)
+
+    if cfg.resume_from_checkpoint:
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            agent.load_state_dict(checkpoint["model_state_dict"])
+            if "optimizer_state_dict" in checkpoint:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            global_step = int(checkpoint.get("global_step", 0))
+            start_update = int(checkpoint.get("update", 0)) + 1
+            episodic_returns = list(checkpoint.get("episodic_returns", []))
+            completed_episodes = int(checkpoint.get("completed_episodes", 0))
+            print(
+                f"Resumed from {checkpoint_path} at "
+                f"update={start_update - 1}, step={global_step}"
+            )
+        except FileNotFoundError:
+            print(f"No checkpoint found at {checkpoint_path}; starting fresh.")
+    else:
+        checkpoint_path = get_available_checkpoint_path(checkpoint_path)
+        if checkpoint_path != cfg.checkpoint_path:
+            print(
+                f"Checkpoint {cfg.checkpoint_path} already exists; "
+                f"saving new run to {checkpoint_path}"
+            )
 
     obs_buf = torch.zeros(
         (cfg.num_steps, cfg.num_envs, obs_dim),
@@ -521,7 +720,6 @@ def main():
         device=device,
     )
 
-    global_step = 0
     start_time = time.time()
 
     next_obs, _ = envs.reset(seed=cfg.seed)
@@ -530,10 +728,9 @@ def main():
     )
     next_done = torch.zeros(cfg.num_envs, dtype=torch.float32, device=device)
 
-    episodic_returns = []
-    completed_episodes = 0
-
-    for update in range(1, num_updates + 1):
+    for update in range(start_update, num_updates + 1):
+        curriculum.set_update(update, num_updates)
+        envs.call("set_curriculum_progress", curriculum.progress)
         if cfg.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             optimizer.param_groups[0]["lr"] = frac * cfg.learning_rate
@@ -554,6 +751,7 @@ def main():
                 action.cpu().numpy()
             )
             next_done_np = np.logical_or(terminations, truncations)
+            running_episode_returns += reward
 
             rewards_buf[step] = torch.tensor(
                 reward, dtype=torch.float32, device=device
@@ -565,14 +763,11 @@ def main():
                 next_done_np, dtype=torch.float32, device=device
             )
 
-            if "final_info" in infos:
-                for item in infos["final_info"]:
-                    if item is not None and "episode" in item:
-                        ep_r = item["episode"]["r"]
-                        if isinstance(ep_r, np.ndarray):
-                            ep_r = float(ep_r.item())
-                        episodic_returns.append(float(ep_r))
-                        completed_episodes += 1
+            finished_envs = np.where(next_done_np)[0]
+            for env_idx in finished_envs:
+                episodic_returns.append(float(running_episode_returns[env_idx]))
+                completed_episodes += 1
+                running_episode_returns[env_idx] = 0.0
 
         with torch.no_grad():
             next_value = agent.get_value(next_obs).squeeze(-1)
@@ -676,6 +871,7 @@ def main():
             f"step={global_step:8d} | "
             f"avg_ep_return(20)={avg_return_str} | "
             f"completed_eps={completed_episodes:4d} | "
+            f"curriculum={curriculum.progress:5.2f} | "
             f"approx_kl={approx_kl.item():8.5f} | "
             f"clipfrac={np.mean(clipfracs):8.3f} | "
             f"sps={sps}"
@@ -697,17 +893,38 @@ def main():
                     f"task={env_kwargs}"
                 )
 
+        if update % cfg.save_every_updates == 0:
+            torch.save(
+                {
+                    "model_state_dict": agent.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": asdict(cfg),
+                    "watch_env_kwargs": default_watch_env_kwargs(cfg),
+                    "global_step": global_step,
+                    "update": update,
+                    "episodic_returns": episodic_returns[-200:],
+                    "completed_episodes": completed_episodes,
+                },
+                checkpoint_path,
+            )
+            print(f"Checkpointed model to {checkpoint_path}")
+
     envs.close()
 
     torch.save(
         {
             "model_state_dict": agent.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
             "config": asdict(cfg),
             "watch_env_kwargs": default_watch_env_kwargs(cfg),
+            "global_step": global_step,
+            "update": num_updates,
+            "episodic_returns": episodic_returns[-200:],
+            "completed_episodes": completed_episodes,
         },
-        cfg.checkpoint_path,
+        checkpoint_path,
     )
-    print(f"Saved model to {cfg.checkpoint_path}")
+    print(f"Saved model to {checkpoint_path}")
 
 
 if __name__ == "__main__":
